@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pipeline de PLN — Avaliações, Reclamações e Atendimento</title>
+  <style>
+    /* =========================================================================
+       UI simples e didática: sem frameworks, CSS + JS puros (estilo pedido).
+       ========================================================================= */
+    :root {
+      --fundo: #0f172a;
+      --cardo: #1e293b;
+      --cardo2: #273449;
+      --texto: #e2e8f0;
+      --texto2: #94a3b8;
+      --borda: #334155;
+      --prim: #38bdf8;
+      --prim2: #0ea5e9;
+      --pos: #22c55e;
+      --neg: #ef4444;
+      --neu: #94a3b8;
+      --fin: #f59e0b;
+      --tec: #8b5cf6;
+      --rad: 12px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      background: var(--fundo);
+      color: var(--texto);
+      line-height: 1.5;
+      padding: 24px 16px 48px;
+    }
+    .wrap { max-width: 960px; margin: 0 auto; }
+    header { text-align: center; margin-bottom: 22px; }
+    header h1 { font-size: 1.5rem; color: var(--prim); letter-spacing: .3px; }
+    header p { color: var(--texto2); font-size: .92rem; margin-top: 6px; }
+    .chip-ativ {
+      display: inline-block; font-size: .72rem; color: var(--texto2);
+      border: 1px solid var(--borda); border-radius: 999px; padding: 2px 10px;
+      margin: 10px 4px 0 0; background: var(--cardo2);
+    }
+    .card {
+      background: var(--cardo); border: 1px solid var(--borda);
+      border-radius: var(--rad); padding: 18px;
+      margin-bottom: 22px;
+    }
+    .card h2 {
+      font-size: 1.02rem; margin-bottom: 12px; color: var(--prim);
+      display: flex; align-items: center; gap: 8px;
+    }
+    textarea {
+      width: 100%; min-height: 110px; resize: vertical;
+      background: var(--cardo2); color: var(--texto);
+      border: 1px solid var(--borda); border-radius: 8px;
+      padding: 12px; font: inherit; font-size: .95rem;
+    }
+    textarea:focus, select:focus { outline: 2px solid var(--prim2); outline-offset: 1px; }
+    .linha-form {
+      display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
+      margin-top: 12px;
+    }
+    label { color: var(--texto2); font-size: .85rem; }
+    select {
+      background: var(--cardo2); color: var(--texto);
+      border: 1px solid var(--borda); border-radius: 8px;
+      padding: 9px 12px; font: inherit; font-size: .92rem;
+    }
+    button {
+      cursor: pointer; font: inherit; font-weight: 600;
+      border: none; border-radius: 8px; padding: 10px 18px;
+    }
+    .btn-analisar {
+      background: linear-gradient(135deg, var(--prim2), var(--prim));
+      color: #062033;
+    }
+    .btn-analisar:disabled { opacity: .55; cursor: wait; }
+    .btn-filtro {
+      background: var(--cardo2); color: var(--texto);
+      border: 1px solid var(--borda);
+    }
+    .btn-limpar {
+      background: transparent; color: var(--texto2);
+      border: 1px solid var(--borda);
+    }
+    .oculto { display: none; }
+    .aviso-erro {
+      background: rgba(239,68,68,.12); border: 1px solid var(--neg);
+      color: #fecaca; padding: 10px 14px; border-radius: 8px;
+      margin-top: 14px; font-size: .9rem;
+    }
+    /* --- Painel de resultados --- */
+    .selo {
+      display: inline-block; border-radius: 999px; padding: 4px 14px;
+      font-size: .85rem; font-weight: 700; text-transform: uppercase;
+      letter-spacing: .5px;
+    }
+    .s-positivo { background: rgba(34,197,94,.15); color: var(--pos); border: 1px solid var(--pos); }
+    .s-negativo  { background: rgba(239,68,68,.15);  color: var(--neg); border: 1px solid var(--neg); }
+    .s-neutro    { background: rgba(148,163,184,.12); color: var(--neu); border: 1px solid var(--neu); }
+    .c-fin      { background: rgba(245,158,11,.12); color: #fcd34d; border: 1px solid var(--fin); }
+    .c-tec      { background: rgba(139,92,246,.12);  color: #c4b5fd; border: 1px solid var(--tec); }
+    .c-ger      { background: rgba(148,163,184,.12); color: var(--neu); border: 1px solid var(--neu); }
+    .grade {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 12px; margin-top: 14px;
+    }
+    .bloco {
+      background: var(--cardo2); border: 1px solid var(--borda);
+      border-radius: 10px; padding: 12px;
+    }
+    .bloco .rot { font-size: .72rem; color: var(--texto2); text-transform: uppercase; letter-spacing: .8px; }
+    .bloco .val { margin-top: 6px; font-size: .95rem; word-break: break-word; }
+    .alerta-neg {
+      margin-top: 14px; display: flex; gap: 10px; align-items: center;
+      padding: 12px 14px; border-radius: 10px; font-size: .9rem;
+    }
+    .alerta-neg.achou { background: rgba(239,68,68,.12); border: 1px solid var(--neg); color: #fecaca; }
+    .alerta-neg.ok   { background: rgba(34,197,94,.10); border: 1px solid var(--pos); color: #bbf7d0; }
+    .tag {
+      display: inline-block; background: var(--fundo); border: 1px solid var(--borda);
+      border-radius: 999px; padding: 3px 12px; margin: 4px 6px 0 0; font-size: .84rem;
+    }
+    .tag b { color: var(--prim); margin-left: 4px; }
+    /* --- Histórico --- */
+    .filtros { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; margin-bottom: 12px; }
+    .filtros select { flex: 0 1 180px; }
+    table { width: 100%; border-collapse: collapse; font-size: .85rem; }
+    th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--borda); vertical-align: top; }
+    th { color: var(--texto2); font-size: .72rem; text-transform: uppercase; letter-spacing: .6px; }
+    tr:hover td { background: rgba(56,189,248,.04); }
+    .excerto { color: var(--texto2); max-width: 300px; }
+    .vazio { color: var(--texto2); text-align: center; padding: 22px; }
+    .mini-badge { display: inline-block; border-radius: 6px; padding: 2px 8px; font-size: .74rem; font-weight: 600; }
+    .b-pos { background: rgba(34,197,94,.14); color: var(--pos); }
+    .b-neg { background: rgba(239,68,68,.14); color: var(--neg); }
+    .b-neu { background: rgba(148,163,184,.12); color: var(--neu); }
+    .spin {
+      width: 14px; height: 14px; border: 2px solid #062033; border-top-color: transparent;
+      border-radius: 50%; display: inline-block; vertical-align: -2px;
+      animation: gira .7s linear infinite;
+    }
+    @keyframes gira { to { transform: rotate(360deg); } }
+    footer { text-align: center; color: var(--texto2); font-size: .78rem; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>🔍 Pipeline de PLN em Português</h1>
+      <p>Regras + NLTK: frequência, negativas, stopwords, sentimento (regra PT + VADER via tradução gratuita) e roteamento por setor.</p>
+      <span class="chip-ativ">Atividades 2–10 integradas</span>
+    </header>
+
+    <!-- ================== FORMULÁRIO DE ANÁLISE ================== -->
+    <section class="card">
+      <h2>📝 Analisar novo texto</h2>
+      <label for="texto">Avaliação, reclamação ou mensagem de atendimento:</label>
+      <textarea id="texto" placeholder="Ex.: O aplicativo travou e nao funciona, estou muito insatisfeito com a demora no pagamento da fatura"></textarea>
+
+      <div class="linha-form">
+        <div>
+          <label for="tipo">Tipo de texto:</label>
+          <select id="tipo">
+            <option value="avaliacao">Avaliação</option>
+            <option value="reclamacao">Reclamação</option>
+            <option value="mensagem">Mensagem de atendimento</option>
+          </select>
+        </div>
+        <button type="button" id="btn-analisar" class="btn-analisar">Analisar</button>
+        <button type="button" id="btn-ler-exemplo" class="btn-limpar">Inserir texto de exemplo</button>
+      </div>
+
+      <div id="aviso-form" class="aviso-erro oculto"></div>
+    </section>
+
+    <!-- ================== PAINEL DE RESULTADO ================== -->
+    <section class="card oculto" id="card-resultado">
+      <h2>🧾 Resultado da análise</h2>
+      <div id="detalhe-tipo" style="margin-bottom:10px;color:var(--texto2);font-size:.85rem"></div>
+
+      <div class="grade">
+        <div class="bloco">
+          <div class="rot">Sentimento (final)</div>
+          <div class="val"><span id="r-sentimento" class="selo">—</span></div>
+          <div class="val" id="r-sentimento-detalhe" style="font-size:.78rem;color:var(--texto2)"></div>
+        </div>
+        <div class="bloco">
+          <div class="rot">Setor / roteamento</div>
+          <div class="val"><span id="r-categoria" class="selo">—</span></div>
+        </div>
+        <div class="bloco">
+          <div class="rot">Texto traduzido (PT → EN)</div>
+          <div class="val" id="r-traducao">—</div>
+        </div>
+        <div class="bloco">
+          <div class="rot">Texto normalizado</div>
+          <div class="val" id="r-normalizado" style="font-size:.82rem">—</div>
+        </div>
+      </div>
+
+      <div id="alerta-neg" class="alerta-neg" style="display:none"></div>
+
+      <div class="grade">
+        <div class="bloco">
+          <div class="rot">Top palavras mais frequentes</div>
+          <div class="val" id="r-top"></div>
+        </div>
+        <div class="bloco">
+          <div class="rot">Tokens (após stopwords)</div>
+          <div class="val" id="r-tokens" style="font-size:.78rem;color:var(--texto2)"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================== HISTÓRICO ================== -->
+    <section class="card">
+      <h2>🗂 Histórico de análises</h2>
+
+      <div class="filtros">
+        <select id="f-sentimento" title="Filtrar por sentimento">
+          <option value="">Todos os sentimentos</option>
+          <option value="positivo">Positivo</option>
+          <option value="negativo">Negativo</option>
+          <option value="neutro">Neutro</option>
+        </select>
+        <select id="f-categoria" title="Filtrar por setor">
+          <option value="">Todos os setores</option>
+          <option value="Financeiro">Financeiro</option>
+          <option value="Suporte Técnico">Suporte Técnico</option>
+          <option value="Geral">Geral</option>
+        </select>
+        <select id="f-tipo" title="Filtrar por tipo de texto">
+          <option value="">Todos os tipos</option>
+          <option value="avaliacao">Avaliação</option>
+          <option value="reclamacao">Reclamação</option>
+          <option value="mensagem">Mensagem de atendimento</option>
+        </select>
+        <button type="button" class="btn-filtro" id="btn-filtrar">Filtrar</button>
+        <button type="button" class="btn-limpar" id="btn-limpar-filtros">Limpar filtros</button>
+      </div>
+
+      <div style="overflow-x:auto">
+        <table>
+          <thead>
+            <tr>
+              <th>Quando</th><th>Texto</th><th>Tipo</th>
+              <th>Sentimento</th><th>Setor</th><th>Críticas</th><th>Tradução</th>
+            </tr>
+          </thead>
+          <tbody id="tabela-historico"></tbody>
+        </table>
+      </div>
+      <div id="historico-vazio" class="vazio oculto">
+        Nenhuma análise registrada ainda — analise um texto acima.
+      </div>
+    </section>
+
+    <footer>
+      Tradução gratuita via deep-translator (endpoint público do Google, sem chave/custo) apenas como ponte para o VADER — regras, stopwords e tokenização seguem em PT-BR.
+    </footer>
+  </div>
+
+  <script>
+    /* =========================================================================
+       Frontend puro (fetch + DOM). Nenhuma dependência externa.
+       ========================================================================= */
+    "use strict";
+
+    const $ = (id) => document.getElementById(id);
+
+    const ROTULO_TIPO = {
+      avaliacao: "Avaliação",
+      reclamacao: "Reclamação",
+      mensagem: "Mensagem de atendimento",
+    };
+
+    /* ---------- helpers de DOM (seguros contra injeção de HTML) ---------- */
+    function criar(o) { return document.createElement(o); }
+    function texto(el, valor) { el.textContent = valor; return el; }
+
+    /* ---------- exemplo de texto para facilitar o teste ---------- */
+    function inserirExemplo() {
+      $("texto").value =
+        "O aplicativo travou e nao funciona, estou muito insatisfeito " +
+        "com a demora e quero cancelar minha assinatura porque a cobrança veio errada";
+      $("tipo").value = "reclamacao";
+    }
+
+    /* ---------- análise ---------- */
+    async function analisar() {
+      const textoEntrada = $("texto").value;
+      const tipo = $("tipo").value;
+      const botao = $("btn-analisar");
+
+      $("aviso-form").classList.add("oculto");
+      botao.disabled = true;
+      botao.innerHTML = '<span class="spin"></span> Analisando...';
+
+      try {
+        const resposta = await fetch("/analisar", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ texto: textoEntrada, tipo_texto: tipo }),
+        });
+        const dados = await resposta.json();
+        if (!resposta.ok) {
+          mostrarErroForm(dados.erro || "Erro ao analisar o texto.");
+          return;
+        }
+        renderizarResultado(dados);
+        await carregarHistorico();
+      } catch (erro) {
+        mostrarErroForm("Falha de rede ao falar com o servidor: " + erro.message);
+      } finally {
+        botao.disabled = false;
+        botao.textContent = "Analisar";
+      }
+    }
+
+    function mostrarErroForm(mensagem) {
+      const aviso = $("aviso-form");
+      texto(aviso, "⚠ " + mensagem);
+      aviso.classList.remove("oculto");
+    }
+
+    function renderizarResultado(d) {
+      $("card-resultado").classList.remove("oculto");
+      texto($("detalhe-tipo"), "Tipo: " + (ROTULO_TIPO[d.tipo_texto] || d.tipo_texto));
+
+      // Sentimento: selo principal + detalhe das duas fontes.
+      const seloSent = $("r-sentimento");
+      seloSent.className = "selo s-" + d.sentimento_final;
+      texto(seloSent, d.sentimento_final);
+      let detalhe = "Regra PT-BR: " + d.sentimento_regra +
+                    " · VADER (texto EN): " + (d.score_vader ? d.score_vader.compound.toFixed(2) + " (" + rotuloVader(d.score_vader.compound) + ")" : "indisponível");
+      texto($("r-sentimento-detalhe"), detalhe);
+
+      // Setor.
+      const CLASSE_CATEGORIA = {
+        "Financeiro": "c-fin",
+        "Suporte Técnico": "c-tec",
+        "Geral": "c-ger",
+      };
+      const seloCateg = $("r-categoria");
+      seloCateg.className = "selo " + (CLASSE_CATEGORIA[d.categoria] || "c-ger");
+      texto(seloCateg, d.categoria);
+
+      // Tradução.
+      texto($("r-traducao"), d.texto_traduzido || "—");
+
+      // Texto normalizado.
+      texto($("r-normalizado"), d.texto_normalizado);
+
+      // Alerta de palavras negativas (Atividade 3).
+      const alerta = $("alerta-neg");
+      if (d.palavras_negativas.length > 0) {
+        alerta.style.display = "flex";
+        alerta.className = "alerta-neg achou";
+        const marcado = document.createElement("span");
+        texto(marcado, "⚠ Atenção: mensagem prioritária — palavras críticas: " +
+              d.palavras_negativas.join(", "));
+        alerta.replaceChildren(marcado);
+      } else {
+        alerta.style.display = "flex";
+        alerta.className = "alerta-neg ok";
+        const ok = document.createElement("span");
+        texto(ok, "✓ Nenhuma palavra crítica detectada (mensagem normal).");
+        alerta.replaceChildren(ok);
+      }
+
+      // Top palavras (Atividades 2 e 7).
+      const top = $("r-top");
+      top.replaceChildren();
+      if (d.top_palavras.length === 0) {
+        top.append(texto(criar("span"), "Nenhuma palavra relevante após remover stopwords."));
+      } else {
+        d.top_palavras.forEach(([palavra, freq]) => {
+          const tag = criar("span");
+          tag.className = "tag";
+          tag.append(document.createTextNode(palavra));
+          const b = criar("b");
+          texto(b, freq);
+          tag.append(b);
+          top.append(tag);
+        });
+      }
+
+      // Tokens.
+      texto($("r-tokens"), d.tokens.join(", "));
+    }
+
+    function rotuloVader(compound) {
+      if (compound >= 0.05) return "positivo";
+      if (compound <= -0.05) return "negativo";
+      return "neutro";
+    }
+
+    /* ---------- histórico ---------- */
+    function montarParams() {
+      const params = new URLSearchParams();
+      const valores = [
+        ["sentimento", $("f-sentimento").value],
+        ["categoria", $("f-categoria").value],
+        ["tipo", $("f-tipo").value],
+      ];
+      valores.forEach(([chave, valor]) => { if (valor) params.set(chave, valor); });
+      return params.toString();
+    }
+
+    async function carregarHistorico() {
+      const query = montarParams();
+      try {
+        const resposta = await fetch("/historico" + (query ? "?" + query : ""));
+        if (!resposta.ok) return;
+        const registros = await resposta.json();
+        renderizarTabela(registros);
+      } catch (erro) {
+        console.error("Falha ao carregar histórico", erro);
+      }
+    }
+
+    function celulaTexto(valor) { return texto(criar("td"), valor || "—"); }
+
+    function renderizarTabela(registros) {
+      const corpo = $("tabela-historico");
+      const vazio = $("historico-vazio");
+      corpo.replaceChildren();
+      vazio.classList.toggle("oculto", registros.length > 0);
+
+      registros.forEach((r) => {
+        const linha = criar("tr");
+
+        // Quando (timestamp ISO -> formato local curto).
+        let quando = r.criado_em.replace("T", " ").slice(0, 19);
+        linha.append(celulaTexto(quando));
+
+        // Texto (com título para ver inteiro).
+        const tdTexto = texto(criar("td"), r.texto_original);
+        tdTexto.className = "excerto";
+        tdTexto.title = r.texto_original;
+        linha.append(tdTexto);
+
+        // Tipo.
+        linha.append(celulaTexto(ROTULO_TIPO[r.tipo_texto] || r.tipo_texto));
+
+        // Sentimento (mini-badge).
+        const tdSent = criar("td");
+        const mini = criar("span");
+        mini.className = "mini-badge b-" + r.sentimento_final;
+        texto(mini, r.sentimento_final);
+        tdSent.append(mini);
+        linha.append(tdSent);
+
+        // Setor.
+        linha.append(celulaTexto(r.categoria));
+
+        // Críticas.
+        const tdNeg = criar("td");
+        if (r.palavras_negativas && r.palavras_negativas.length > 0) {
+          texto(tdNeg, "⚠ " + r.palavras_negativas.join(", "));
+          tdNeg.title = "Mensagem prioritária (Atividade 3)";
+        } else {
+          texto(tdNeg, "—");
+        }
+        linha.append(tdNeg);
+
+        // Tradução.
+        let traduzido = "—";
+        if (r.texto_traduzido === "tradução indisponível") traduzido = "Indisponível";
+        else if (r.texto_traduzido) traduzido = "OK";
+        linha.append(celulaTexto(traduzido));
+
+        corpo.append(linha);
+      });
+    }
+
+    /* ---------- fios ---------- */
+    $("btn-analisar").addEventListener("click", analisar);
+    $("btn-ler-exemplo").addEventListener("click", inserirExemplo);
+    $("btn-filtrar").addEventListener("click", carregarHistorico);
+    $("btn-limpar-filtros").addEventListener("click", () => {
+      ["f-sentimento", "f-categoria", "f-tipo"].forEach((id) => { $(id).value = ""; });
+      carregarHistorico();
+    });
+    // Enter no textarea dispara a análise.
+    $("texto").addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); analisar(); }
+    });
+
+    // Carrega o histórico ao abrir a página.
+    carregarHistorico();
+  </script>
+</body>
+</html>

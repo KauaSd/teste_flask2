@@ -1,0 +1,5 @@
+# Dependências do Pipeline de PLN (Flask + NLTK + tradução gratuita)
+flask>=3.0
+nltk>=3.9
+deep-translator>=1.11
+requests>=2.31
