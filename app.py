@@ -40,16 +40,23 @@ em inglês. Como o nosso texto chega em português, usamos tradução automátic
 PT -> EN APENAS como ponte interna para esses recursos. As regras de negócio,
 a tokenização, as stopwords e as palavras-chave continuam rodando em PT-BR.
 
-TRADUÇÃO SEM CHAVE E SEM CUSTO:
-O deep-translator, com o backend GoogleTranslator, acessa o endpoint público
-e gratuito de tradução do Google — NÃO usa o Google Cloud Translate API
-(serviço pago, que exige credenciais/API key). Aqui a tradução não gera
-custo nem precisa de chave. Há ainda um fallback leve que acessa o mesmo
-endpoint público gratuito direto via `requests`, caso o deep-translator
-esteja bloqueado (bastante comum: esse IP pode receber HTTP 429 do scraper
-do deep-translator, enquanto o endpoint JSON continua acessível).
-Se ambos falharem (ex.: sem internet), o pipeline NÃO quebra: segue com a
-análise 100% em PT-BR e registra "tradução indisponível".
+TRADUÇÃO SEM CHAVE E SEM CUSTO — E O PROBLEMA DO HTTP 429:
+O Google NÃO usa o Google Cloud Translate API aqui (serviço pago, que exige
+API key); usamos apenas os endpoints públicos e gratuitos de tradução. O
+detalhe que fazia a tradução falhar é o BLOQUEIO ANTI-BOT: sem um
+User-Agent de navegador, esses endpoints respondem HTTP 429 com uma página
+HTML "Sorry..." — e o pipeline recebia HTML no lugar do JSON,tradução vazia.
+Por isso `traduzir_pt_en` percorre uma cadeia de provedores, TODOS com os
+mesmos headers de navegador:
+
+    1. clients5.google.com/translate_a/t  (endpoint do dicionário do Chrome)
+    2. translate.googleapis.com/..._a/single  (endpoint JSON clássico)
+    3. api.mymemory.translated.net  (provedor independente do Google, sem chave)
+    4. deep-translator (GoogleTranslator) — mantido como último recurso
+
+Todos são gratuitos e não exigem chave. Se TODOS falharem (ex.: sem
+internet), o pipeline NÃO quebra: segue com a análise 100% em PT-BR e
+registra "tradução indisponível".
 ================================================================================
 """
 
@@ -61,6 +68,7 @@ import unicodedata
 from collections import Counter
 from datetime import datetime, timezone
 
+import requests
 from flask import Flask, jsonify, render_template, request
 
 # ==============================================================================
@@ -88,10 +96,36 @@ TIPOS_VALIDOS = {"avaliacao", "reclamacao", "mensagem"}
 # Palavras negativas/críticas usadas na Atividade 3 (priorização de suporte)
 # e no sentimento por regra (Atividade 5/10). A ordem aqui define a ordem de
 # exibição em detectar_palavras_negativas (determinística).
+# O casamento é por RADICAL (ver seção "COMPARAÇÃO DE PALAVRAS"), então basta
+# listar a raiz uma vez: "péssimos"/"pessima" casam com "péssimo", e "pessimo"
+# sem acento também.
 PALAVRAS_NEGATIVAS = [
     "ruim", "péssimo", "erro", "problema", "demora", "demorou",
     "falha", "defeito", "horrível", "atraso", "atrasou", "lento",
     "travou", "trava", "quebrou", "insatisfeito", "reclamação", "cara",
+    # "reclamações" entra à parte: o Snowball gera radicais DIFERENTES para o
+    # singular ("reclamacão" -> "reclamaca") e o plural ("reclamações" ->
+    # "reclamaco"), e a comparação por prefixo não alcança a divergência na
+    # última letra. Listar as duas formas cobre o plural.
+    "reclamações",
+    # Raízes ampliadas para cobrir reclamações do dia a dia que, antes,
+    # passavam batidas e caíam em "mensagem normal".
+    "pior", "odiei", "odeio", "detesto", "irritante", "irritou",
+    "lentidão", "carregando", "congelou", "travando",
+    "impossível", "recusado", "recusou", "duplicado",
+    "errado", "errada", "ninguém", "inutilizável", "lixo", "furada",
+    "vergonha", "decepcionante", "cancelado", "perdi",
+]
+
+# Expressões negativas compostas (com espaço). Não podem ser detectadas
+# token a token — "não" vira stopword na etapa 4 e "funciona" sozinho não
+# significa nada — então são procuradas no texto já normalizado, como as
+# frases do roteador. "não funciona" é, na prática, a reclamação mais comum
+# em suporte; sem esta lista ela caía em "mensagem normal".
+PALAVRAS_NEGATIVAS_FRASES = [
+    "não funciona", "não abre", "não consigo", "não carrega", "não conecta",
+    "não responde", "não dá", "não pagou", "não recebi", "não autoriza",
+    "sem resposta", "sem acesso", "travando direto",
 ]
 
 # Palavras positivas usadas no sentimento por regra (Atividade 5/10).
@@ -165,6 +199,150 @@ try:
 except Exception:
     _ANALISADOR_VADER = None
 
+# Stemmer português. Fallback seguro: se o Snowball não estiver disponível,
+# `_radical` simplesmente não corta sufixo (só remove acentos), e o
+# casamento por radical exato + prefixo continua funcionando.
+try:
+    from nltk.stem.snowball import SnowballStemmer
+
+    _STEMMER_PT = SnowballStemmer("portuguese")
+except Exception:
+    _STEMMER_PT = None
+
+
+# ==============================================================================
+# COMPARAÇÃO DE PALAVRAS — TOLERANTE A ACENTO E FLEXÃO
+# ==============================================================================
+# POR QUE ISTO EXISTE
+# O detector de palavras negativas (Atividade 3) e as regras de sentimento/
+# categoria comparavam o token com a palavra do vocabulário por IGUALDADE
+# EXATA de string. Isso quebrava de duas formas:
+#
+#   1. ACENTO — o cliente digita "pessimo", "otimo", "reclamacao" (sem acento,
+#      o que é comum ao digitar rápido). O vocabulário tem "péssimo",
+#      "ótimo", "reclamação" COM acento -> nunca casava.
+#   2. FLEXÃO — o vocabulário tem "erro"/"problema"/"péssimo", mas o texto
+#      traz "erros"/"problemas"/"pessimidade" -> nunca casava.
+#
+# Resultado: mensagens claramente críticas ("pessimo, o site ta todo errado
+# nao abre") retornavam "Nenhuma palavra crítica detectada".
+#
+# A SOLUÇÃO
+# Antes de comparar, reduzimos as DUAS pontas ao mesmo radical:
+#   texto do cliente -> sem acento -> radical (stemmer)
+#   palavra do léxico -> sem acento -> radical (stemmer)
+# Assim "pessimo", "péssimos" e "péssima" caem todos no mesmo radical "pessim".
+#
+# IMPORTANTE — os radicais são usados SÓ PARA COMPARAR. Os tokens exibidos,
+# o "top palavras" e a normalização continuam com o texto original (com
+# acento), então a saída legível para o usuário não muda em nada.
+#
+# A comparação aceita radical exato OU radical-prefixo (um começa com o
+# outro) com no mínimo _RADICAL_MINIMO letras de lado. O piso de 4 letras
+# evita falso positivo do tipo "cara" -> radical "car" casando com "carinho".
+# ---------------------------------------------------------------------------
+
+# Tamanho mínimo (em letras) para que a comparação por prefixo valha.
+_RADICAL_MINIMO = 4
+
+
+def _sem_acento(texto: str) -> str:
+    """Remove os acentos: "péssimo" -> "pessimo", "reclamação" -> "reclamacao".
+
+    A decomposição Unicode NFD separa cada caractere acentuado em letra base
+    + marca combinante; basta descartar as marcas (categoria Mn) e voltar
+    para a forma normalizada NFC.
+    """
+    decomposto = unicodedata.normalize("NFD", texto.lower())
+    sem_marcas = "".join(
+        caractere
+        for caractere in decomposto
+        if unicodedata.category(caractere) != "Mn"
+    )
+    return unicodedata.normalize("NFC", sem_marcas)
+
+
+def _radical(palavra: str) -> str:
+    """Reduz uma palavra ao radical de comparação: sem acento e sem flexão.
+
+    "péssimo" -> "pessim" | "demorando" -> "demor" | "erros" -> "erros"
+    (o Snowball em português é limitado: "erro" e "erros" às vezes recebem
+    radicais diferentes — por isso a comparação também aceita PREFIXO, e não
+    só igualdade.)
+    """
+    limpa = _sem_acento(palavra)
+    if _STEMMER_PT is None:
+        return limpa
+    try:
+        return _STEMMER_PT.stem(limpa)
+    except Exception:
+        return limpa
+
+
+def _radicalizar_texto(texto: str) -> str:
+    """Aplica `_radical` a cada palavra e devolve o texto unido por espaços.
+
+    Usado para casar palavras-chave COM ESPAÇO ("não funciona", "não consigo"),
+    que não podem ser procuradas token a token.
+    """
+    return " ".join(_radical(palavra) for palavra in texto.split())
+
+
+def _construir_indice(vocabulario):
+    """Monta {radical: [termos do léxico]} para busca por radical.
+
+    Vários termos podem cair no mesmo radical, então o índice guarda uma
+    lista de termos por radical, e não um único termo.
+    """
+    indice = {}
+    for termo in vocabulario:
+        indice.setdefault(_radical(termo), []).append(termo)
+    return indice
+
+
+def _termos_que_casam(indice, radical: str) -> set:
+    """Devolve os termos do léxico casados com o radical informado.
+
+    Casa por igualdade exata de radical OU por prefixo mútuo, desde que ambos
+    tenham pelo menos _RADICAL_MINIMO letras (evita casar radicais curtos demais
+    e gerar falsos positivos).
+    """
+    if not radical:
+        return set()
+    achados = set()
+    for radical_lexico, termos in indice.items():
+        if radical == radical_lexico:
+            achados.update(termos)
+        elif min(len(radical), len(radical_lexico)) >= _RADICAL_MINIMO and (
+            radical.startswith(radical_lexico) or radical_lexico.startswith(radical)
+        ):
+            achados.update(termos)
+    return achados
+
+
+# Índices de radical de cada vocabulário, prontos para busca. Construídos uma
+# única vez na importação: as listas acima são a fonte da verdade, e mudar uma
+# palavra aqui reflete no índice automaticamente.
+#   {"pessim": ["péssimo"], "ruim": ["ruim"], ...}
+_INDICE_NEGATIVAS = _construir_indice(PALAVRAS_NEGATIVAS)
+_INDICE_POSITIVAS = _construir_indice(PALAVRAS_POSITIVAS)
+# Frases negativas já convertidas para radical de texto, para busca por
+# substring no texto normalizado (ver detectar_palavras_negativas).
+_FRASES_NEGATIVAS_RADICAL = [
+    _radicalizar_texto(frase) for frase in PALAVRAS_NEGATIVAS_FRASES
+]
+# Roteador: índice por setor, separando termos simples (busca por token) de
+# frases (busca por radical de texto, porque "não" cai como stopword na
+# etapa 4 e a frase precisa ser procurada no texto já normalizado).
+_INDICE_ROTEADOR = {
+    setor: {
+        "radicais": _construir_indice([termo for termo in termos if " " not in termo]),
+        "frases_radical": [_radicalizar_texto(termo) for termo in termos if " " in termo],
+    }
+    for setor, termos in ROTEADOR_SETORES.items()
+}
+
+
 
 # ==============================================================================
 # ETAPA 1 — LIMPEZA DO TEXTO  [ATIVIDADE 9]
@@ -189,62 +367,161 @@ def normalizar_texto(texto: str) -> str:
 # ==============================================================================
 # ETAPA 2 — TRADUÇÃO PT -> EN GRATUITA (ponte para recursos do NLTK em inglês)
 # ==============================================================================
-def _traduzir_google_gratuito_direto(texto: str) -> str:
-    """Fallback leve para o MESMO serviço gratuito do Google.
+# Os endpoints públicos do Google recusam requisições anônimas de cliente
+# desconhecido: respondem HTTP 429 com uma página HTML "Sorry..." em vez do
+# JSON. O que o Google checa é o cabeçalho — simular um navegador com um
+# User-Agent real (mais Accept-Language/Referer coerentes) faz o endpoint
+# responder 200 normalmente. Estes headers são o requisito que faltava.
+_HEADERS_NAVEGADOR = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    ),
+    "Accept": "*/*",
+    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+    "Referer": "https://translate.google.com/",
+    "Connection": "keep-alive",
+}
 
-    O deep-translator scraper (HTML) recebe HTTP 429 em alguns IPs,
-    enquanto o endpoint público JSON continua acessível. Este fallback usa o
-    endpoint translate.googleapis.com/translate_a/single — gratuito, SEM chave
-    de API e SEM custo, igual ao backend GoogleTranslator do deep-translator.
-    Retorna TIPO_TRADUCAO_INDISPONIVEL se a rede/endpoint falharem.
+# Limites de tamanho por provedor (com folga sobre o máximo real do serviço).
+LIMITE_CHARS_GOOGLE = 4500    # caracteres aceitos pelo endpoint do Google
+LIMITE_BYTES_MYMEMORY = 450   # bytes aceitos pelo MyMemory (máx. real: 500)
+
+# Sessão reaproveitada entre as requisições: mantém cookies e a conexão viva,
+# o que reduz a chance de o Google exibir o desafio de verificação.
+_SESSAO = requests.Session()
+_SESSAO.headers.update(_HEADERS_NAVEGADOR)
+
+
+def _dividir_texto(texto: str, limite: int):
+    """Divide o texto em pedaços de no máximo `limite` caracteres.
+
+    O corte acontece em fronteiras de palavra (nunca no meio de um token), o
+    que preserva a qualidade da tradução em textos longos.
     """
-    try:
-        import requests
+    if len(texto) <= limite:
+        return [texto]
 
-        resposta = requests.get(
+    pedacos, atual = [], ""
+    for palavra in texto.split(" "):
+        while len(palavra) > limite:  # palavra isolada maior que o limite
+            pedacos.append(palavra[:limite])
+            palavra = palavra[limite:]
+        if len(atual) + len(palavra) + 1 > limite:
+            pedacos.append(atual)
+            atual = palavra
+        else:
+            atual = f"{atual} {palavra}".strip()
+    if atual:
+        pedacos.append(atual)
+    return pedacos
+
+
+def _traduzir_via_chrome(texto: str) -> str:
+    """Provedor principal: endpoint público usado pelo dicionário do Chrome.
+
+    É gratuito, dispensa chave de API e — diferentemente do scraper HTML do
+    deep-translator, que recebe 429 com frequência — devolve o JSON direto
+    quando a requisição traz os headers de navegador.
+    """
+    partes = []
+    for pedaco in _dividir_texto(texto, LIMITE_CHARS_GOOGLE):
+        resposta = _SESSAO.get(
+            "https://clients5.google.com/translate_a/t",
+            params={
+                "client": "dict-chrome-ex", "sl": "pt", "tl": "en", "q": pedaco,
+            },
+            timeout=10,
+        )
+        resposta.raise_for_status()
+        # Formato da resposta: ["tradução", "original", ...]
+        dados = resposta.json()
+        if isinstance(dados, list) and dados and isinstance(dados[0], str):
+            partes.append(dados[0])
+    return " ".join(parte for parte in partes if parte).strip()
+
+
+def _traduzir_via_endpoint_json(texto: str) -> str:
+    """Segundo provedor: endpoint JSON clássico do Google (client=gtx)."""
+    partes = []
+    for pedaco in _dividir_texto(texto, LIMITE_CHARS_GOOGLE):
+        resposta = _SESSAO.get(
             "https://translate.googleapis.com/translate_a/single",
             params={
                 "client": "gtx", "sl": "pt", "tl": "en",
-                "dt": "t", "q": texto,
+                "dt": "t", "q": pedaco,
             },
             timeout=10,
         )
         resposta.raise_for_status()
         dados = resposta.json()
-        # A resposta tem o formato [[["tradução", "original", ...], ...], ...]
+        # Formato: [[["tradução", "original", ...], ...], ...]
         trechos = [parte[0] for parte in dados[0] if parte and parte[0]]
-        traducao = "".join(trechos).strip()
-        return traducao or TIPO_TRADUCAO_INDISPONIVEL
-    except Exception:
-        return TIPO_TRADUCAO_INDISPONIVEL
+        partes.append("".join(trechos))
+    return " ".join(parte for parte in partes if parte).strip()
+
+
+def _traduzir_via_mymemory(texto: str) -> str:
+    """Terceiro provedor: MyMemory, independente do Google e sem chave.
+
+    Existe para o caso de o Google continuar bloqueando este IP: como é um
+    serviço distinto, o bloqueio de um não afeta o outro. Tem cota diária
+    anônima, por isso fica atrás dos provedores do Google.
+    """
+    partes = []
+    for pedaco in _dividir_texto(texto, LIMITE_BYTES_MYMEMORY):
+        resposta = _SESSAO.get(
+            "https://api.mymemory.translated.net/get",
+            params={"q": pedaco, "langpair": "pt|en"},
+            timeout=15,
+        )
+        resposta.raise_for_status()
+        partes.append(resposta.json()["responseData"]["translatedText"])
+    return " ".join(parte for parte in partes if parte).strip()
+
+
+def _traduzir_via_deep_translator(texto: str) -> str:
+    """Quarto provedor: deep-translator (GoogleTranslator), já declarado em
+    requirements.txt. Mantido como último recurso porque o scraper dele é o
+    que mais recebe bloqueio anti-bot (HTTP 429)."""
+    from deep_translator import GoogleTranslator
+
+    resultado = GoogleTranslator(source="pt", target="en").translate(texto)
+    return (resultado or "").strip()
+
+
+# Ordem de tentativa: mais confiável -> menos confiável.
+_PROVEDORES_TRADUCAO = (
+    _traduzir_via_chrome,
+    _traduzir_via_endpoint_json,
+    _traduzir_via_mymemory,
+    _traduzir_via_deep_translator,
+)
 
 
 def traduzir_pt_en(texto_normalizado: str) -> str:
-    """Traduz PT -> EN usando deep-translator (GoogleTranslator gratuito).
+    """Traduz PT -> EN com os provedores gratuitos, sem chave e sem custo.
 
-    - NÃO usa chave de API nem gera custo (diferente do Google Cloud
-      Translate API, que é pago e exige credenciais).
-    - O try/except externo garante que falhas de rede, bloqueios (429) ou
-      indisponibilidade do serviço NÃO quebram o pipeline.
-    - Se a tradução falhar, retorna TIPO_TRADUCAO_INDISPONIVEL e o pipeline
-      segue apenas com a análise em PT-BR.
+    Percorre a cadeia de provedores até um devolver texto não vazio, de modo
+    que um bloqueio (429) ou uma falha de rede em um endpoint não derruba a
+    tradução. Se TODOS falharem, retorna TIPO_TRADUCAO_INDISPONIVEL e o
+    pipeline segue intacto com a análise em PT-BR.
     """
     if not texto_normalizado:
         return ""
 
-    # Opção principal: deep-translator (biblioteca gratuita, sem chave).
-    try:
-        from deep_translator import GoogleTranslator
+    for provedor in _PROVEDORES_TRADUCAO:
+        try:
+            resultado = provedor(texto_normalizado)
+            if resultado and resultado.strip():
+                return resultado.strip()
+        except Exception as exc:  # rede, 429, JSON inválido, cota esgotada
+            print(
+                f"[aviso] Tradução indisponível em {provedor.__name__}: {exc}. "
+                f"Tentando o próximo provedor."
+            )
 
-        tradutor = GoogleTranslator(source="pt", target="en")
-        resultado = tradutor.translate(texto_normalizado)
-        if resultado and resultado.strip():
-            return resultado.strip()
-    except Exception:
-        pass  # cai no fallback abaixo
-
-    # Fallback: mesmo serviço gratuito do Google, via requests direto.
-    return _traduzir_google_gratuito_direto(texto_normalizado)
+    return TIPO_TRADUCAO_INDISPONIVEL
 
 
 # ==============================================================================
@@ -288,21 +565,38 @@ def contar_frequencia(tokens_limpos, top_n: int = TOP_N):
 # ==============================================================================
 # ETAPA 6 — DETECÇÃO DE PALAVRAS NEGATIVAS  [ATIVIDADE 3]
 # ==============================================================================
-def detectar_palavras_negativas(tokens_limpos):
+def detectar_palavras_negativas(tokens_limpos, texto_normalizado: str = ""):
     """Sinaliza mensagens prioritárias ao encontrar palavras críticas.
 
     Raciocínio: se o cliente escreveu "ruim", "péssimo", "erro", "problema"
     ou "demora", a mensagem deve ir para o topo da fila de suporte.
+
+    A comparação é feita por RADICAL (ver seção "COMPARAÇÃO DE PALAVRAS"), o
+    que faz "pessimo" (sem acento), "péssimos" e "péssima" casarem com
+    "péssimo" e aparecerem no alerta.
+
+    Palavras compostas ("não funciona") são procuradas no texto normalizado
+    pelo radical, porque não sobrevivem à tokenização com stopword removida.
     A ordem do retorno segue a constante PALAVRAS_NEGATIVAS (determinística).
     """
-    presentes = set(tokens_limpos)
-    return [palavra for palavra in PALAVRAS_NEGATIVAS if palavra in presentes]
+    achados = set()
+    for token in tokens_limpos:
+        achados |= _termos_que_casam(_INDICE_NEGATIVAS, _radical(token))
+
+    radical_texto = _radicalizar_texto(texto_normalizado)
+    for indice, frase in enumerate(_FRASES_NEGATIVAS_RADICAL):
+        if frase and frase in radical_texto:
+            achados.add(PALAVRAS_NEGATIVAS_FRASES[indice])
+
+    return [palavra for palavra in PALAVRAS_NEGATIVAS if palavra in achados] + [
+        frase for frase in PALAVRAS_NEGATIVAS_FRASES if frase in achados
+    ]
 
 
 # ==============================================================================
 # ETAPA 7 — SENTIMENTO (regra PT + reforço VADER no texto EN)  [ATIVIDADES 5/10]
 # ==============================================================================
-def classificar_sentimento(tokens_limpos, texto_traduzido: str):
+def classificar_sentimento(tokens_limpos, texto_traduzido: str, texto_normalizado: str = ""):
     """Classifica positivo/negativo/neutro combinando DUAS fontes:
 
     (a) REGRA CONDICIONAL em PT-BR  — conta palavras positivas vs negativas
@@ -311,6 +605,10 @@ def classificar_sentimento(tokens_limpos, texto_traduzido: str):
         e score de reforço. O VADER é excelente em inglês; por isso o texto
         foi traduzido na Etapa 2. Se a tradução falhou, fica "indisponível".
 
+    A contagem de negativas reaproveita `detectar_palavras_negativas`, de modo
+    que o alerta de "palavra crítica" e o sentimento NUNCA se contradizem:
+    se o alerta disparou, a regra já sabe que o texto é negativo.
+
     Resultado final (condicional simples combinando as fontes):
         - tradução indisponível ......... prevalece a regra PT-BR;
         - regra neutra .................. o VADER decide;
@@ -318,8 +616,10 @@ def classificar_sentimento(tokens_limpos, texto_traduzido: str):
         - fontes concordam .............. a opinião comum vence;
         - fontes discordam (pos x neg) .. final = neutro (indefinido).
     """
-    positivas = sum(1 for t in tokens_limpos if t in PALAVRAS_POSITIVAS)
-    negativas = sum(1 for t in tokens_limpos if t in PALAVRAS_NEGATIVAS)
+    positivas = sum(
+        1 for t in tokens_limpos if _termos_que_casam(_INDICE_POSITIVAS, _radical(t))
+    )
+    negativas = len(detectar_palavras_negativas(tokens_limpos, texto_normalizado))
 
     # (a) Regra condicional simples em PT-BR.
     if positivas > negativas:
@@ -381,16 +681,19 @@ def classificar_categoria(tokens_limpos, texto_normalizado: str) -> str:
          limpos; frases ("não funciona") no texto normalizado.
       2. Vence o setor com MAIS ocorrências; empate respeita ORDEM_SETORES.
       3. Nenhuma ocorrência -> "Geral".
+
+    Ambos os caminhos comparam por RADICAL, então "cobrancas"/"fatura" e
+    "nao funciona" (sem acento) também acionam o roteamento.
     """
-    tokens = set(tokens_limpos)
     ocorrencias = {}
-    for setor, palavras_chave in ROTEADOR_SETORES.items():
+    radical_texto = _radicalizar_texto(texto_normalizado)
+    for setor, indice in _INDICE_ROTEADOR.items():
         total = 0
-        for palavra_chave in palavras_chave:
-            if " " in palavra_chave:  # frase -> busca no texto normalizado
-                if palavra_chave in texto_normalizado:
-                    total += 1
-            elif palavra_chave in tokens:  # palavra simples -> nos tokens
+        for token in tokens_limpos:
+            if _termos_que_casam(indice["radicais"], _radical(token)):
+                total += 1
+        for frase in indice["frases_radical"]:
+            if frase in radical_texto:  # frase -> busca no texto normalizado
                 total += 1
         ocorrencias[setor] = total
 
@@ -557,10 +860,10 @@ def analisar_texto(texto: str, tipo_texto: str = "avaliacao") -> dict:
     top_palavras = [list(item) for item in top]  # JSON-friendly
 
     # 6. Palavras negativas (Atividade 3)
-    negativas = detectar_palavras_negativas(tokens_limpos)
+    negativas = detectar_palavras_negativas(tokens_limpos, normalizado)
 
     # 7. Sentimento combinado (Atividades 5 e 10)
-    sentimento = classificar_sentimento(tokens_limpos, traduzido)
+    sentimento = classificar_sentimento(tokens_limpos, traduzido, normalizado)
 
     # 8. Categoria/setor (Atividades 6 e 8)
     categoria = classificar_categoria(tokens_limpos, normalizado)
